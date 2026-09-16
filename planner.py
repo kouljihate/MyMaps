@@ -392,23 +392,29 @@ def split_by_area(poly, dim, frac=0.5):
     return lower, upper
 
 
-def split_equal_areas(poly, n):
-    """Recursively cut a polygon into n strips of (nearly) equal area."""
+def split_equal_areas(poly, n, dim="auto"):
+    """Recursively cut a polygon into n strips of (nearly) equal area.
+
+    dim: "auto" cuts along the longest bbox dimension, "x" produces vertical
+    (north-south) strips, "y" produces horizontal (east-west) strips.
+    """
     if n <= 1 or poly is None or poly.is_empty:
         return [poly] if poly and not poly.is_empty else []
-    lon_m, lat_m = extents_m(poly)
-    dim = "x" if lon_m >= lat_m else "y"
+    if dim == "auto":
+        lon_m, lat_m = extents_m(poly)
+        dim = "x" if lon_m >= lat_m else "y"
     left_n = n // 2
     lower, upper = split_by_area(poly, dim, left_n / n)
     if lower.is_empty or upper.is_empty:
         return split_into_parts(poly, n)
-    return split_equal_areas(lower, left_n) + split_equal_areas(upper, n - left_n)
+    return split_equal_areas(lower, left_n, dim) + split_equal_areas(upper, n - left_n, dim)
 
 
-def split_to_band(poly, lo_m2, hi_m2):
+def split_to_band(poly, lo_m2, hi_m2, dim="auto"):
     """Split a polygon into sectors whose area falls inside [lo_m2, hi_m2].
 
     Sectors are equal-area strips so every one lands inside the band.
+    dim is forwarded to split_equal_areas (see there).
     """
     if poly is None or poly.is_empty:
         return []
@@ -420,12 +426,12 @@ def split_to_band(poly, lo_m2, hi_m2):
     target = (lo_m2 + hi_m2) / 2.0
     n = max(1, int(round(total / target)))
 
-    direct = split_equal_areas(poly, n)
+    direct = split_equal_areas(poly, n, dim)
     if all(lo_m2 <= area_m2(p) <= hi_m2 for p in direct):
         return absorb_small(direct, 60.0)
 
-    candidates = [split_equal_areas(poly, t) for t in (n, n + 1, n - 1, n + 2, n - 2)
-                  if t >= 1]
+    candidates = [split_equal_areas(poly, t, dim)
+                  for t in (n, n + 1, n - 1, n + 2, n - 2) if t >= 1]
     for parts in candidates:
         if parts and all(lo_m2 <= area_m2(p) <= hi_m2 for p in parts):
             return absorb_small(parts, 60.0)
@@ -920,7 +926,15 @@ def render_planner_tab(df: pd.DataFrame, fetch_alt: bool):
 
     # ---------------- geometry ----------------
     land_area = area_m2(land)
-    sectors = split_to_band(land, sec_min, sec_max)
+    sector_configs = [
+        {"key": "balanced", "label": "Balanced (cut along the longest side)",
+         "sectors": split_to_band(land, sec_min, sec_max)},
+        {"key": "rows", "label": "Rows (horizontal strips)",
+         "sectors": split_to_band(land, sec_min, sec_max, dim="y")},
+        {"key": "columns", "label": "Columns (vertical strips)",
+         "sectors": split_to_band(land, sec_min, sec_max, dim="x")},
+    ]
+    sectors = sector_configs[0]["sectors"]
     n_sectors = len(sectors)
     zones = []
     for si, s in enumerate(sectors):
@@ -1053,38 +1067,24 @@ def render_planner_tab(df: pd.DataFrame, fetch_alt: bool):
                     "loaded point altitudes.")
     st.caption(" ".join(note))
 
-    st.subheader("Sector overview")
+    st.subheader("Sector configurations")
     sec_tile = st.selectbox("Sector base map", list(TILE_LAYERS), key="sector_tile")
-    sec_df = pd.DataFrame([{
-        "Sector": f"S{i+1}",
-        "Area (m\u00b2)": round(area_m2(s)),
-        "Area (ha)": round(area_m2(s) / 10000, 3),
-    } for i, s in enumerate(sectors)])
-    st.dataframe(sec_df, width="stretch")
-    sec_map = build_planner_map(land, sectors, [], [], basin_pt, basin_alt,
-                                [], sec_tile, {}, show_sectors_only=True)
-    st_folium(sec_map, width="100%", height=500)
+    tabs = st.tabs([f"{cfg['label']} — {len(cfg['sectors'])} sectors"
+                    for cfg in sector_configs])
+    for tab, cfg in zip(tabs, sector_configs):
+        with tab:
+            cfg_df = pd.DataFrame([{
+                "Sector": f"S{i+1}",
+                "Area (m\u00b2)": round(area_m2(s)),
+                "Area (ha)": round(area_m2(s) / 10000, 3),
+                "Share (%)": round(100 * area_m2(s) / land_area, 2) if land_area else 0,
+            } for i, s in enumerate(cfg["sectors"])])
+            st.dataframe(cfg_df, width="stretch")
+            cfg_map = build_planner_map(
+                land, cfg["sectors"], [], [], basin_pt, basin_alt,
+                [], sec_tile, {}, show_sectors_only=True)
+            st_folium(cfg_map, width="100%", height=480)
     st.divider()
-
-    p_tile = st.selectbox("Planner base map", list(TILE_LAYERS), key="planner_tile")
-    pmap, pinfo = st.columns([2.2, 1.4])
-    with pmap:
-        pm = build_planner_map(land, sectors, zones, valve_pts, basin_pt, basin_alt,
-                               configs, p_tile, valve_alts)
-        st_folium(pm, width="100%", height=600)
-
-    with pinfo:
-        st.subheader("Configuration summary")
-        for cfg in configs:
-            st.markdown(f"- **{cfg['label']}**: pipe ≈ {cfg['length_m']:,.0f} m, "
-                        f"{cfg['n_valves']} valves")
-        if design:
-            st.caption(f"Basin: {design['volume_m3']:.0f} m3 storage, "
-                       f"{design['footprint_m2']:,.0f} m2 footprint at {depth:.1f} m "
-                       f"depth for {design['trees']:,} trees.")
-        if head_m is not None:
-            st.caption(f"Pump head: {head_m:.1f} m | Pump: "
-                       f"{pump_kw:.1f} kW" if head_m > 0 else "No pump needed (gravity).")
 
     # ---- costs & comparison ----
     dfc = pd.DataFrame(table)
