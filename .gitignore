@@ -1,0 +1,5 @@
+venv/
+__pycache__/
+*.pyc
+elevations_cache.json
+output/
