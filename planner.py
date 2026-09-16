@@ -19,7 +19,7 @@ import hashlib
 import io
 import json
 import math
-from datetime import datetime
+from collections import Counter
 from pathlib import Path
 
 import folium
@@ -27,8 +27,8 @@ import pandas as pd
 import requests
 import streamlit as st
 from shapely import wkt as swkt
-from shapely.geometry import LineString, Point, Polygon, box, mapping
-from shapely.ops import nearest_points, unary_union
+from shapely.geometry import LineString, MultiLineString, Point, Polygon, box, mapping
+from shapely.ops import linemerge, nearest_points, unary_union
 from streamlit_folium import st_folium
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -55,6 +55,7 @@ TILE_LAYERS = {
 }
 
 LAND_KW = ("land", "terrain", "perimetre", "périmètre", "parcelle", "boundary")
+SECTOR_KW = ("sector", "secteur")
 BASIN_KW = ("basin", "reservoir", "bassin", "weel", "well", "puit")
 
 CROPS = {
@@ -439,6 +440,181 @@ def split_to_band(poly, lo_m2, hi_m2, dim="auto"):
     return absorb_small(best, 60.0)
 
 
+def detect_sectors(df: pd.DataFrame):
+    """Return list of Polygon sectors found in the CSV (sorted by name).
+
+    Sectors are polygon features whose name/description contains a keyword
+    from SECTOR_KW (e.g. "S1", "secteur", "Sector"). Returns the list of
+    Shapely Polygons sorted by name, or an empty list if none found.
+    """
+    if df is None or df.empty:
+        return []
+    sectors = []
+    for row in df.itertuples():
+        g = row.geometry
+        if g.geom_type not in ("Polygon",):
+            continue
+        if not any(k in f"{row.name} {row.description}".lower() for k in SECTOR_KW):
+            continue
+        sectors.append((row.name, g))
+    sectors.sort(key=lambda r: r[0])
+    return [g for _, g in sectors]
+
+
+def _rotate_point(px, py, cx, cy, cos_a, sin_a):
+    """Rotate (px, py) around (cx, cy) by angle with (cos_a, sin_a)."""
+    dx, dy = px - cx, py - cy
+    return cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a
+
+
+def _unrotate_polygon(poly, cx, cy, cos_a, sin_a):
+    """Rotate a polygon *back* by the inverse angle."""
+    from shapely.geometry import Polygon as SPoly
+    exterior = [(_rotate_point(x, y, cx, cy, cos_a, sin_a)) for x, y in poly.exterior.coords]
+    holes = [[(_rotate_point(x, y, cx, cy, cos_a, sin_a))
+              for x, y in ring.coords] for ring in poly.interiors]
+    return SPoly(exterior, holes)
+
+
+def _split_along_direction(poly, dir_x, dir_y, frac):
+    """Cut poly with a line perpendicular to (dir_x, dir_y) at *frac* of the
+    projected bbox span.  Returns (lower, upper) in the original CRS."""
+    from shapely.geometry import Polygon as SPoly
+    minx, miny, maxx, maxy = poly.bounds
+    cx = (minx + maxx) / 2.0
+    cy = (miny + maxy) / 2.0
+    # rotate so dir aligns with x-axis
+    norm = math.hypot(dir_x, dir_y)
+    if norm < 1e-12:
+        return poly, poly  # degenerate
+    dx, dy = dir_x / norm, dir_y / norm
+    cos_a, sin_a = dx, dy  # rotate by this angle maps dir -> (1, 0)
+
+    def fwd(pt):
+        return _rotate_point(pt[0], pt[1], cx, cy, cos_a, sin_a)
+
+    def rev(pt):
+        return _rotate_point(pt[0], pt[1], cx, cy, cos_a, -sin_a)
+
+    # rotate polygon to axis-aligned frame
+    rot_ext = [fwd(c) for c in poly.exterior.coords]
+    rot_holes = [[fwd(c) for c in ring.coords] for ring in poly.interiors]
+    rot = SPoly(rot_ext, rot_holes)
+    rotx0, roty0, rotx1, roty1 = rot.bounds
+    cut_x = rotx0 + frac * (rotx1 - rotx0)
+    left = rot.intersection(box(rotx0, roty0, cut_x, roty1))
+    right = rot.intersection(box(cut_x, roty0, rotx1, roty1))
+    # rotate results back
+    lower = _unrotate_polygon(left, cx, cy, cos_a, -sin_a) if left.is_valid and not left.is_empty else left
+    upper = _unrotate_polygon(right, cx, cy, cos_a, -sin_a) if right.is_valid and not right.is_empty else right
+    return lower, upper
+
+
+def _split_equal_areas_dir(poly, n, dir_x, dir_y):
+    """Recursively split polygon into n equal-area strips along *dir*."""
+    if n <= 1 or poly is None or poly.is_empty:
+        return [poly] if poly and not poly.is_empty else []
+    left_n = n // 2
+    lower, upper = _split_along_direction(poly, dir_x, dir_y, left_n / n)
+    if lower is None or upper is None or lower.is_empty or upper.is_empty:
+        # fallback: split along default axes
+        lon_m, lat_m = extents_m(poly)
+        dim = "x" if lon_m >= lat_m else "y"
+        return split_into_parts(poly, n)
+    return (_split_equal_areas_dir(lower, left_n, dir_x, dir_y)
+            + _split_equal_areas_dir(upper, n - left_n, dir_x, dir_y))
+
+
+def split_contour(land, vh, lo_m2, hi_m2):
+    """Contour-aligned strips: perpendicular to the downhill slope so every
+    strip sits on a roughly constant elevation band.
+
+    This is the optimal layout for gravity-fed contour irrigation.
+    Falls back to default split if no altitude data is available.
+    """
+    if land is None or land.is_empty:
+        return []
+    total = area_m2(land)
+    if total <= 0 or total <= hi_m2:
+        return [land]
+
+    lo_m2, hi_m2 = sorted((float(lo_m2), float(hi_m2)))
+    target = (lo_m2 + hi_m2) / 2.0
+
+    if vh is None:
+        # no altitude data: fall back to default balanced
+        return split_to_band(land, lo_m2, hi_m2)
+
+    # contour direction = perpendicular to downhill
+    dir_x, dir_y = vh[1], -vh[0]
+    n = max(1, int(round(total / target)))
+
+    direct = _split_equal_areas_dir(land, n, dir_x, dir_y)
+    if direct and all(lo_m2 <= area_m2(p) <= hi_m2 for p in direct):
+        return absorb_small(direct, 60.0)
+
+    candidates = [_split_equal_areas_dir(land, t, dir_x, dir_y)
+                  for t in (n, n + 1, n - 1, n + 2, n - 2) if t >= 1]
+    for parts in candidates:
+        if parts and all(lo_m2 <= area_m2(p) <= hi_m2 for p in parts):
+            return absorb_small(parts, 60.0)
+    best = min(candidates, key=lambda ps: sum(abs(area_m2(p) - target) for p in ps))
+    return absorb_small(best, 60.0)
+
+
+def split_water_proximity(land, water_pt, lo_m2, hi_m2):
+    """Sectors radiating from the water source: concentric bands shrinking
+    toward the water point, each holding equal area.
+
+    Closest bands are smallest (shortest pipe run), outer bands wider.
+    """
+    if land is None or land.is_empty or water_pt is None:
+        return split_to_band(land, lo_m2, hi_m2)
+    total = area_m2(land)
+    if total <= 0 or total <= hi_m2:
+        return [land]
+
+    lo_m2, hi_m2 = sorted((float(lo_m2), float(hi_m2)))
+    target = (lo_m2 + hi_m2) / 2.0
+    n = max(1, int(round(total / target)))
+    if n <= 1:
+        return [land]
+
+    rings = []
+    remaining = land
+    for i in range(max(n - 1, 1)):
+        if remaining.is_empty:
+            break
+        remaining_area = area_m2(remaining)
+        if remaining_area <= hi_m2:
+            break
+        frac = (n - i - 1) / (n - i)
+        minx_r, miny_r, maxx_r, maxy_r = remaining.bounds
+        hi_d = min(maxx_r - minx_r, maxy_r - miny_r) / 2.0 + 1e-9
+        lo_d = 0.0
+        for _ in range(40):
+            d = (lo_d + hi_d) / 2.0
+            core = remaining.buffer(-d)
+            a = area_m2(core) if not core.is_empty else 0.0
+            if a > remaining_area * frac:
+                lo_d = d
+            else:
+                hi_d = d
+        core = remaining.buffer(-hi_d)
+        if core.is_empty:
+            break
+        strip = remaining.difference(core)
+        if strip.is_empty or area_m2(strip) < 1.0:
+            break
+        strips = [g for g in flatten(strip) if not g.is_empty]
+        rings.extend(absorb_small(strips, 60.0))
+        remaining = core
+
+    rings.append(remaining)
+    rings = [g for pg in rings for g in flatten(pg) if not g.is_empty]
+    return absorb_small(rings, 60.0)
+
+
 def get_land_polygon(df: pd.DataFrame):
     """Estimate the land parcel outline from the CSV features."""
     if df is None or df.empty:
@@ -473,6 +649,31 @@ def existing_basin(df: pd.DataFrame):
         ):
             return g
     return None
+
+
+def water_source(df: pd.DataFrame):
+    """Return the (lon, lat, alt) of the water source fixed in the CSV.
+
+    Prefers an explicit POINT well/source feature, then the centroid of a
+    basin polygon. Uses the feature's own Z altitude when available.
+    Returns (None, None) when no water feature is present.
+    """
+    pt = None
+    poly = None
+    for row in df.itertuples():
+        g = row.geometry
+        if not any(k in f"{row.name} {row.description}".lower() for k in BASIN_KW):
+            continue
+        if g.geom_type == "Point":
+            pt = g
+            break
+        if pt is None and g.geom_type == "Polygon":
+            poly = g
+    if pt is not None:
+        return (pt.x, pt.y), extract_z(pt)
+    if poly is not None:
+        return centroid_pt(poly), extract_z(poly)
+    return None, None
 
 
 def land_alt_points(df: pd.DataFrame):
@@ -598,6 +799,145 @@ def zone_furrows(zone, vh, n=2):
 def centroid_pt(poly):
     p = poly.centroid
     return (p.x, p.y)
+
+
+# ---------------------------------------------------------------------------
+# planting rows + tree points
+# ---------------------------------------------------------------------------
+def _row_segments(geom):
+    """Return row geometry as lists of (lon, lat) coords (handles holes)."""
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "MultiLineString":
+        return [list(g.coords) for g in geom.geoms]
+    if geom.geom_type == "LineString":
+        return [list(geom.coords)]
+    return []
+
+
+def _trees_on_segments(seg_coords, tree_m, to_m, to_deg):
+    """Walk clipped row segments in meters and return tree points."""
+    tree_pts = []
+    for coords in seg_coords:
+        pts = [to_m(c) for c in coords]
+        if len(pts) < 2:
+            continue
+        ds = [0.0]
+        for i in range(1, len(pts)):
+            ds.append(ds[-1] + math.hypot(pts[i][0] - pts[i - 1][0],
+                                          pts[i][1] - pts[i - 1][1]))
+        total = ds[-1]
+        if total < tree_m:
+            continue
+        t = tree_m / 2.0  # half-spacing margin at each row end
+        seg = 1
+        while t <= total - tree_m / 2.0:
+            while seg < len(ds) and ds[seg] < t:
+                seg += 1
+            if seg >= len(ds):
+                break
+            a, b = pts[seg - 1], pts[seg]
+            seg_len = ds[seg] - ds[seg - 1]
+            frac = (t - ds[seg - 1]) / seg_len if seg_len > 0 else 0.0
+            tree_pts.append(to_deg((a[0] + (b[0] - a[0]) * frac,
+                                    a[1] + (b[1] - a[1]) * frac)))
+            t += tree_m
+    return tree_pts
+
+
+def rows_and_trees_for_zone(zone, zone_label, row_m, tree_m, u):
+    """Planting rows + trees inside one zone, in the zone's own CRS.
+
+    Rows run parallel to the contour direction *u* (degrees space) and are
+    spaced *row_m* meters apart; a tree is planted every *tree_m* meters along
+    each row.
+
+    Returns ``(rows, trees)`` where:
+      * ``rows``  = list of ``(label, LineString-or-MultiLineString)`` with
+        labels like ``S1Z1R1``
+      * ``trees`` = list of ``(label, (lon, lat))`` with labels like
+        ``S1Z1R1T3``
+    """
+    if zone is None or zone.is_empty or row_m <= 0 or tree_m <= 0:
+        return [], []
+    minx, miny, maxx, maxy = zone.bounds
+    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    lon_scale, lat_scale = meters_per_deg(zone.bounds)
+
+    def to_m(pt):
+        return ((pt[0] - cx) * lon_scale, (pt[1] - cy) * lat_scale)
+
+    def to_deg(pt):
+        return (cx + pt[0] / lon_scale, cy + pt[1] / lat_scale)
+
+    # row direction in metric space (same as the trench/contour direction u)
+    um = (u[0] * lon_scale, u[1] * lat_scale)
+    un = math.hypot(um[0], um[1]) or 1.0
+    ux, uy = um[0] / un, um[1] / un
+    nx, ny = -uy, ux  # across-rows direction (meters)
+
+    diag = math.sqrt(((maxx - minx) * lon_scale) ** 2 +
+                     ((maxy - miny) * lat_scale) ** 2)
+
+    # span of the zone projected onto the across-rows axis (meters)
+    projs = []
+    for poly in flatten(zone):
+        for x, y in poly.exterior.coords:
+            mx, my = to_m((x, y))
+            projs.append(mx * nx + my * ny)
+    if not projs:
+        return [], []
+    pmin, pmax = min(projs), max(projs)
+    span = pmax - pmin
+    if span < 1e-9:
+        return [], []
+    n_rows = max(1, int(round(span / row_m)))
+    step = span / n_rows
+
+    rows = []
+    trees = []
+    for ri in range(n_rows):
+        off = pmin + step * (ri + 0.5)
+        p0 = to_deg((nx * off - ux * diag, ny * off - uy * diag))
+        p1 = to_deg((nx * off + ux * diag, ny * off + uy * diag))
+        seg_coords = clip_line(zone, p0, p1)
+        if not seg_coords:
+            continue
+        parts = []
+        for coords in seg_coords:
+            if len(coords) >= 2:
+                parts.append(LineString(coords))
+        if not parts:
+            continue
+        row_geom = linemerge(parts)
+        row_segs = _row_segments(row_geom)
+        pts = _trees_on_segments(row_segs, tree_m, to_m, to_deg)
+        if not pts:
+            continue
+        row_label = f"{zone_label}R{ri + 1}"
+        for ti, pt in enumerate(pts, 1):
+            trees.append((f"{row_label}T{ti}", pt))
+        rows.append((row_label, row_geom))
+    return rows, trees
+
+
+def rows_and_trees(zones, row_m, tree_m, u):
+    """Planting rows + trees across every zone (labels rooted at zone name)."""
+    all_rows, all_trees = [], []
+    for z in zones:
+        zrows, ztrees = rows_and_trees_for_zone(z["poly"], z["label"],
+                                                row_m, tree_m, u)
+        all_rows.extend(zrows)
+        all_trees.extend(ztrees)
+    return all_rows, all_trees
+
+
+def sample_trees(trees, cap):
+    """Evenly thin the tree list down to at most *cap* entries."""
+    if cap <= 0 or len(trees) <= cap:
+        return list(trees)
+    step = len(trees) / float(cap)
+    return [trees[int(i * step)] for i in range(cap)]
 
 
 # ---------------------------------------------------------------------------
@@ -739,7 +1079,15 @@ def build_configs(land, sectors, zones, basin_pt, u, vh):
 # planner map
 # ---------------------------------------------------------------------------
 def build_planner_map(land, sectors, zones, valves, basin_pt, basin_alt,
-                      configs, tile_name, valve_alts, show_sectors_only=False):
+configs, tile_name, valve_alts, show_sectors_only=False,
+                      rows=None, trees=None, max_tree_markers=1500,
+                      layers=None):
+    """Build the planning map. *layers* is a set of visible layers among
+    {"sectors", "zones", "rows", "trees", "water", "other"}; None = all."""
+    rows = rows or []
+    trees = trees or []
+    if layers is None:
+        layers = {"sectors", "zones", "rows", "trees", "water", "other"}
     center = [(land.bounds[1] + land.bounds[3]) / 2, (land.bounds[0] + land.bounds[2]) / 2]
     m = folium.Map(location=center, zoom_start=18, tiles=None, control_scale=True)
     for name, cfg in TILE_LAYERS.items():
@@ -748,75 +1096,96 @@ def build_planner_map(land, sectors, zones, valves, basin_pt, basin_alt,
     folium.FitBounds([[land.bounds[1], land.bounds[0]], [land.bounds[3], land.bounds[2]]]).add_to(m)
 
     # land outline
-    fc = {"type": "FeatureCollection",
-          "features": [{"type": "Feature", "geometry": mapping(land),
-                        "properties": {"area_m2": area_m2(land)}}]}
-    folium.GeoJson(
-        fc, name="Land", style_function=lambda f: {
-            "color": "#d73027", "weight": 4, "opacity": 1, "fill": False},
-        tooltip=folium.GeoJsonTooltip(fields=["area_m2"], aliases=["Area m2"],
-                                      labels=True, sticky=True),
-    ).add_to(m)
+    if "other" in layers:
+        fc = {"type": "FeatureCollection",
+              "features": [{"type": "Feature", "geometry": mapping(land),
+                            "properties": {"area_m2": area_m2(land)}}]}
+        folium.GeoJson(
+            fc, name="Land", style_function=lambda f: {
+                "color": "#d73027", "weight": 4, "opacity": 1, "fill": False},
+            tooltip=folium.GeoJsonTooltip(fields=["area_m2"], aliases=["Area m2"],
+                                          labels=True, sticky=True),
+        ).add_to(m)
 
     # sectors
-    fc_s = {"type": "FeatureCollection", "features": [
-        {"type": "Feature", "geometry": mapping(s),
-         "properties": {"sector": i + 1, "area_m2": round(area_m2(s))}}
-        for i, s in enumerate(sectors)]}
-    folium.GeoJson(
-        fc_s, name="Sectors", style_function=lambda f: {
-            "color": "#f07d00", "weight": 2, "fillColor": "#f07d00",
-            "fillOpacity": 0.10, "dashArray": "5,5"},
-        tooltip=folium.GeoJsonTooltip(fields=["sector", "area_m2"],
-                                       aliases=["Sector", "Area m2"], sticky=True),
-    ).add_to(m)
+    if "sectors" in layers:
+        fc_s = {"type": "FeatureCollection", "features": [
+            {"type": "Feature", "geometry": mapping(s),
+             "properties": {"sector": i + 1, "area_m2": round(area_m2(s))}}
+            for i, s in enumerate(sectors)]}
+        folium.GeoJson(
+            fc_s, name="Sectors", style_function=lambda f: {
+                "color": "#f07d00", "weight": 2, "fillColor": "#f07d00",
+                "fillOpacity": 0.10, "dashArray": "5,5"},
+            tooltip=folium.GeoJsonTooltip(fields=["sector", "area_m2"],
+                                          aliases=["Sector", "Area m2"], sticky=True),
+        ).add_to(m)
 
     if show_sectors_only:
         folium.LayerControl(collapsed=True).add_to(m)
         return m
 
     # zones
-    fc_z = {"type": "FeatureCollection", "features": [
-        {"type": "Feature", "geometry": mapping(z["poly"]),
-         "properties": {"zone": z["label"], "valve": z["valve"][0]}}
-        for z in zones]}
-    folium.GeoJson(
-        fc_z, name="Zones (3 / sector)", style_function=lambda f: {
-            "color": "#2b83ba", "weight": 1.5, "fillColor": "#2b83ba",
-            "fillOpacity": 0.18},
-        tooltip=folium.GeoJsonTooltip(fields=["zone"], aliases=["Zone"], sticky=True),
-    ).add_to(m)
+    if "zones" in layers:
+        per_sector = round(len(zones) / len(sectors)) if sectors else 0
+        fc_z = {"type": "FeatureCollection", "features": [
+            {"type": "Feature", "geometry": mapping(z["poly"]),
+             "properties": {"zone": z["label"], "valve": z["valve"][0]}}
+            for z in zones]}
+        folium.GeoJson(
+            fc_z, name=f"Zones ({per_sector} / sector)", style_function=lambda f: {
+                "color": "#2b83ba", "weight": 1.5, "fillColor": "#2b83ba",
+                "fillOpacity": 0.18},
+            tooltip=folium.GeoJsonTooltip(fields=["zone"], aliases=["Zone"], sticky=True),
+        ).add_to(m)
 
-    # valves
-    vg = folium.FeatureGroup(name="Valves")
-    for i, z in enumerate(zones, 1):
-        a = valve_alts.get(z["valve"])
-        tip = f"V{i} - {z['label']}" + (f" | Alt: {a:.1f} m" if a is not None else "")
-        folium.CircleMarker(
-            location=[z["valve"][1], z["valve"][0]], radius=8, color="#1565c0",
-            weight=2, fill=True, fill_color="#42a5f5", fill_opacity=0.9,
-            tooltip=tip, popup=tip,
-        ).add_to(vg)
-    vg.add_to(m)
+    # planting rows
+    if rows and "rows" in layers:
+        g = folium.FeatureGroup(name=f"Planting rows ({len(rows)})")
+        for label, geom in rows:
+            for coords in _row_segments(geom):
+                if len(coords) < 2:
+                    continue
+                folium.PolyLine([(lat, lon) for lon, lat in coords],
+                                color="#1a9641", weight=5, opacity=0.95,
+                                tooltip=label).add_to(g)
+        g.add_to(m)
+
+    # tree markers (thinned to max_tree_markers for performance)
+    if trees and "trees" in layers:
+        g = folium.FeatureGroup(name=f"Trees ({len(trees)})")
+        svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" '
+               'viewBox="0 0 10 10"><circle cx="5" cy="2.8" r="2.8" fill="#1a9641"/>'
+               '<path d="M2.6 6.4 Q5 5.6 7.4 6.4 L6 7.4 L6.6 9 L3.4 9 L4 7.4 Z" '
+               'fill="#1a9641"/><rect x="4.4" y="7" width="1.2" height="2.6" '
+               'fill="#6b4a2b"/></svg>')
+        tree_icon = folium.DivIcon(html=svg, icon_size=(10, 10), icon_anchor=(5, 10))
+        shown = sample_trees(trees, max_tree_markers)
+        for label, pt in shown:
+            folium.Marker(location=[pt[1], pt[0]], icon=tree_icon,
+                          tooltip=label).add_to(g)
+        g.add_to(m)
 
     # basin
-    ba = "not available"
-    if basin_alt is not None:
-        ba = f"{basin_alt:.1f} m"
-    folium.Marker(
-        location=[basin_pt[1], basin_pt[0]], icon=folium.Icon(color="red", icon="tint", prefix="fa"),
-        tooltip=f"Basin (gravity feed point) | Alt {ba}",
-    ).add_to(m)
+    if "water" in layers:
+        ba = "not available"
+        if basin_alt is not None:
+            ba = f"{basin_alt:.1f} m"
+        folium.Marker(
+            location=[basin_pt[1], basin_pt[0]], icon=folium.Icon(color="red", icon="tint", prefix="fa"),
+            tooltip=f"Basin (gravity feed point) | Alt {ba}",
+        ).add_to(m)
 
     # config polylines
-    for cfg in configs:
-        g = folium.FeatureGroup(name=cfg["label"])
-        for coords in cfg["lines"]:
-            if len(coords) < 2:
-                continue
-            folium.PolyLine([(lat, lon) for lon, lat in coords],
-                            color=cfg["color"], weight=3, opacity=0.9).add_to(g)
-        g.add_to(m)
+    if configs and "other" in layers:
+        for cfg in configs:
+            g = folium.FeatureGroup(name=cfg["label"])
+            for coords in cfg["lines"]:
+                if len(coords) < 2:
+                    continue
+                folium.PolyLine([(lat, lon) for lon, lat in coords],
+                                color=cfg["color"], weight=3, opacity=0.9).add_to(g)
+            g.add_to(m)
 
     folium.LayerControl(collapsed=True).add_to(m)
     return m
@@ -832,13 +1201,18 @@ def _wtk(geom, precision: int = 6) -> str:
         return geom.wkt
 
 
-def plan_to_csv(land, sectors, zones, config=None, valve_alts=None) -> str:
+def plan_to_csv(land, sectors, zones, config=None, valve_alts=None,
+                rows=None, trees=None) -> str:
     """Serialize the final plan into a CSV with WKT,name,description columns.
 
     config: one of the options returned by build_configs() whose polyline
     layout should be included, or None to export geometry only.
+    rows/trees: optional planting rows (label, geom) and trees
+    (label, (lon, lat)) to append to the export.
     """
     valve_alts = valve_alts or {}
+    rows = rows or []
+    trees = trees or []
     out = io.StringIO()
     w = csv.writer(out, lineterminator="\n")
     w.writerow(["WKT", "name", "description"])
@@ -854,6 +1228,11 @@ def plan_to_csv(land, sectors, zones, config=None, valve_alts=None) -> str:
         desc = "Valve" + (f" | Alt {a:.1f} m" if a is not None else "")
         w.writerow([_wtk(Point(z["valve"])), f"V{vi}", desc])
 
+    for rlabel, geom in rows:
+        w.writerow([_wtk(geom), rlabel, "Row"])
+    for tlabel, pt in trees:
+        w.writerow([_wtk(Point(pt)), tlabel, "Tree"])
+
     if config is not None:
         for ji, line in enumerate(config["lines"], 1):
             if len(line) < 2:
@@ -866,35 +1245,42 @@ def plan_to_csv(land, sectors, zones, config=None, valve_alts=None) -> str:
 # ---------------------------------------------------------------------------
 # Streamlit planner tab
 # ---------------------------------------------------------------------------
-def eur(x):
-    return f"{x:,.0f} €"
+def make_zones(sectors, zones_per):
+    """Split every sector into zones and return them with valve points."""
+    zones = []
+    for si, s in enumerate(sectors):
+        pieces = split_into_parts(s, zones_per)
+        for zi, pz in enumerate(pieces):
+            if pz.is_empty:
+                continue
+            zname = f"S{si + 1}Z{zi + 1}"
+            zones.append({"poly": pz, "sector_idx": si, "zone_idx": zi,
+                          "label": zname, "valve": centroid_pt(pz), "area": area_m2(pz)})
+    return zones
 
 
-def _auto_save_plan(plan_csv: str):
-    """Write the finished plan (land, sectors, zones, valves, trenches) to output/.
+def _save_config_csv(plan_csv: str, filename: str):
+    """Save a plan CSV to output/ with content-hash dedup.
 
-    Writes a new timestamped file once per distinct plan content so repeated
-    widget tweaks don't spam the output folder; returns the file path or None.
+    Skips the write if an identical file already exists so repeated reruns
+    don't spam the output folder. Returns the file path.
     """
-    key = hashlib.md5(plan_csv.encode("utf-8")).hexdigest()
-    if st.session_state.get("auto_plan_key") == key:
-        return st.session_state.get("auto_plan_path")
     out_dir = BASE_DIR / "output"
     out_dir.mkdir(exist_ok=True)
-    name = f"processed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    path = out_dir / name
-    with path.open("w", encoding="utf-8", newline="") as fh:
-        fh.write(plan_csv)
-    st.session_state.auto_plan_key = key
-    st.session_state.auto_plan_path = str(path)
+    content_hash = hashlib.md5(plan_csv.encode("utf-8")).hexdigest()[:12]
+    path = out_dir / f"{filename}_{content_hash}.csv"
+    if not path.exists():
+        with path.open("w", encoding="utf-8", newline="") as fh:
+            fh.write(plan_csv)
     return str(path)
 
 
 def render_planner_tab(df: pd.DataFrame, fetch_alt: bool):
     st.subheader("Irrigation planner")
-    st.caption("Sectors are equal strips sized inside the chosen area band "
-               "(default 9 000 - 11 000 m2), zones = valves, basin size follows "
-               "the tree count - plain language: dodge the pipe, follow the slope.")
+    st.caption("Smart sectors: contour strips follow the slope of your land, "
+               "water-proximity bands radiate from your water point. If your CSV "
+               "already contains sectors, they are used as-is and only zones are "
+               "generated (zones = valves).")
 
     land = get_land_polygon(df)
     if land is None:
@@ -902,7 +1288,7 @@ def render_planner_tab(df: pd.DataFrame, fetch_alt: bool):
                 "in its name/description, or any polygons to outline the field.")
         return
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     with c1:
         crop = st.selectbox("Crop", list(CROPS), index=0)
         sx, sy, lpd = CROPS[crop]
@@ -917,115 +1303,68 @@ def render_planner_tab(df: pd.DataFrame, fetch_alt: bool):
         sec_max = st.number_input("Sector max area (m2)", 1000, 200000, 11000, step=500)
         sec_min, sec_max = sorted((sec_min, sec_max))
         zones_per = st.slider("Zones per sector (valves)", 2, 6, 3)
-        pump_hrs = st.number_input("Pumping hours per day", 1, 24, 10)
-    with c4:
-        pipe_cost = st.number_input("Pipe cost (€/m)", 0.5, 20.0, 2.0, step=0.1)
-        valve_cost = st.number_input("Valve cost (€)", 5.0, 500.0, 30.0, step=5.0)
-        pump_cost = st.number_input("Pump cost (€/kW installed)", 100.0, 2000.0, 500.0, step=50.0)
-        basin_cost = st.number_input("Basin excavation (€/m3)", 1.0, 50.0, 4.0, step=0.5)
 
     # ---------------- geometry ----------------
     land_area = area_m2(land)
-    sector_configs = [
-        {"key": "balanced", "label": "Balanced (cut along the longest side)",
-         "sectors": split_to_band(land, sec_min, sec_max)},
-        {"key": "rows", "label": "Rows (horizontal strips)",
-         "sectors": split_to_band(land, sec_min, sec_max, dim="y")},
-        {"key": "columns", "label": "Columns (vertical strips)",
-         "sectors": split_to_band(land, sec_min, sec_max, dim="x")},
-    ]
-    sectors = sector_configs[0]["sectors"]
-    n_sectors = len(sectors)
-    zones = []
-    for si, s in enumerate(sectors):
-        pieces = split_into_parts(s, zones_per)
-        for zi, pz in enumerate(pieces):
-            sz = pz.area
-            zname = f"S{si + 1}Z{zi + 1}"
-            zones.append({"poly": pz, "sector_idx": si, "zone_idx": zi,
-                          "label": zname, "valve": centroid_pt(pz), "area": area_m2(pz)})
-    valve_pts = [z["valve"] for z in zones]
 
-    # ---------------- altitude / slope ----------------
+    # ---------------- altitude / slope (from land boundary) ----------------
     alt_pts = land_alt_points(df)
-    if not alt_pts and fetch_alt:
-        # sample the field outline so we can estimate the slope
+    if not alt_pts:
         coords = list(land.exterior.coords)
         step = max(1, len(coords) // 12)
         alt_pts = [(c[0], c[1], None) for c in coords[::step]]
+    vh = fit_down_vector([(p[0], p[1], p[2]) for p in alt_pts])
+    u = contour_dir(vh)
+
+    # ---------------- basin placement: fixed water point from CSV ----------------
+    basin_pt, basin_alt = water_source(df)
+    if basin_pt is None:
+        land_z = extract_z(land)
+        if land_z is not None:
+            basin_alt = land_z
+            basin_pt = centroid_pt(land)
+        else:
+            basin_pt, basin_alt = centroid_pt(land), None
+
+    # ---------------- intelligent sector configs ----------------
+    csv_sectors = detect_sectors(df)
+    if csv_sectors:
+        sector_configs = [{"key": "csv", "label": "Sectors from CSV", "sectors": csv_sectors}]
+        st.info("Sectors detected in your CSV and used as-is. "
+                f"Zones ({zones_per}/sector) are generated inside them.")
+    else:
+        sector_configs = [
+            {"key": "contour", "label": "Contour strips (slope-aware)",
+             "sectors": split_contour(land, vh, sec_min, sec_max)},
+            {"key": "water", "label": "Water-proximity bands",
+             "sectors": split_water_proximity(land, basin_pt, sec_min, sec_max)},
+        ]
+
+    sectors = sector_configs[0]["sectors"]
+    n_sectors = len(sectors)
+    zones = make_zones(sectors, zones_per)
+    valve_pts = [z["valve"] for z in zones]
+
+    # ---------------- valve altitudes & slope refinement ----------------
     valve_alts = lookup_alts(valve_pts, fetch_alt)
     known_vals = [a for a in valve_alts.values() if a is not None]
-
     slope_samples = [(p[0], p[1], p[2]) for p in alt_pts]
     if known_vals:
         slope_samples += [(pt[0], pt[1], v) for pt, v in valve_alts.items() if v is not None]
     vh = fit_down_vector(slope_samples)
     u = contour_dir(vh)
 
-    # basin placement: highest point so water can flow by gravity
-    land_z = extract_z(land)
-    if land_z is not None:
-        basin_alt = land_z
-        basin_pt = centroid_pt(land)
-    else:
-        candidates = dict(valve_alts)
-        ex = existing_basin(df)
-        if ex is not None:
-            candidates[("existing_basin", 0.0)] = extract_z(ex)
-        if candidates:
-            best = max(candidates.items(), key=lambda kv: kv[1] if kv[1] is not None else -1e9)
-            if best[1] is not None:
-                basin_pt = best[0] if isinstance(best[0], tuple) and len(best[0]) == 2 else centroid_pt(land)
-                basin_alt = best[1]
-            else:
-                basin_pt, basin_alt = centroid_pt(land), None
-        else:
-            basin_pt, basin_alt = centroid_pt(land), None
-
     # ---------------- basin sizing ----------------
     design = basin_design(land_area, (sp[0], sp[1]), liters, autonomy, depth)
     ex_basin = existing_basin(df)
 
-    # ---------------- configs & cost ----------------
+    # ---------------- configs & layout options ----------------
     configs = build_configs(land, sectors, zones, basin_pt, u, vh)
 
     max_valve_alt = max(known_vals) if known_vals else None
-    if max_valve_alt is None or basin_alt is None:
-        head_m = None
-        pump_kw_disp = None
-    else:
+    head_m = None
+    if basin_alt is not None and max_valve_alt is not None:
         head_m = max(0.0, max_valve_alt - basin_alt + 3.0)
-    if design:
-        flow = pump_flow_m3s(design["daily_m3"], pump_hrs)
-        if head_m is not None:
-            pump_kw = pump_power_kw(flow, head_m)
-            pump_eur = pump_kw * pump_cost
-        else:
-            pump_kw, pump_eur = None, 0.0
-    else:
-        pump_kw, pump_eur = None, 0.0
-
-    basin_eur = design["volume_m3"] * basin_cost if design else 0.0
-
-    table = []
-    for cfg in configs:
-        pipe_eur = cfg["length_m"] * pipe_cost
-        valves_eur = cfg["n_valves"] * valve_cost
-        cfg["pipe_eur"] = pipe_eur
-        cfg["valves_eur"] = valves_eur
-        cfg["total"] = pipe_eur + valves_eur + pump_eur + basin_eur
-        table.append({
-            "Option": cfg["key"],
-            "Description": cfg["label"],
-            "Pipe (m)": round(cfg["length_m"]),
-            "Valves": cfg["n_valves"],
-            "Pump (kW)": round(pump_kw, 2) if pump_kw is not None else None,
-            "Pipe cost": pipe_eur,
-            "Valve cost": valves_eur,
-            "Pump cost": pump_eur,
-            "Basin cost": basin_eur,
-            "Total": cfg["total"],
-        })
 
     # ---------------- layout ----------------
     m1, m2, m3, m4 = st.columns(4)
@@ -1055,13 +1394,11 @@ def render_planner_tab(df: pd.DataFrame, fetch_alt: bool):
     note = []
     if head_m is not None:
         if head_m <= 0:
-            note.append("Gravity feed possible: every valve is below the basin -> "
-                        "no pump needed (lowest budget).")
+            note.append("Gravity feed possible: every valve site sits below the basin.")
         else:
-            note.append(f"Basin is {head_m:.0f} m below the highest valve -> a pump "
-                        f"({pump_kw:.1f} kW) is required.")
+            note.append(f"Basin is {head_m:.0f} m below the highest valve site.")
     else:
-        note.append("Fetch point altitudes to compute pumping needs (slope follow).")
+        note.append("Fetch point altitudes to compute elevation (slope follow).")
     if vh is not None:
         note.append("Trenches are drawn along contour lines estimated from the "
                     "loaded point altitudes.")
@@ -1069,61 +1406,113 @@ def render_planner_tab(df: pd.DataFrame, fetch_alt: bool):
 
     st.subheader("Sector configurations")
     sec_tile = st.selectbox("Sector base map", list(TILE_LAYERS), key="sector_tile")
+    layer_map = {"Sector": "sectors", "Zone": "zones", "Row": "rows",
+                 "Trees": "trees", "Water": "water", "Other": "other"}
+    map_layers = {
+        layer_map[k] for k in st.pills(
+            "Show on map", options=list(layer_map),
+            selection_mode="multi",
+            default=["Sector", "Zone", "Row", "Trees", "Water", "Other"],
+            key="map_layers_pills")}
     tabs = st.tabs([f"{cfg['label']} — {len(cfg['sectors'])} sectors"
                     for cfg in sector_configs])
-    for tab, cfg in zip(tabs, sector_configs):
+    for idx, (tab, cfg) in enumerate(zip(tabs, sector_configs)):
         with tab:
-            cfg_df = pd.DataFrame([{
-                "Sector": f"S{i+1}",
-                "Area (m\u00b2)": round(area_m2(s)),
-                "Area (ha)": round(area_m2(s) / 10000, 3),
-                "Share (%)": round(100 * area_m2(s) / land_area, 2) if land_area else 0,
-            } for i, s in enumerate(cfg["sectors"])])
+            cfg_zones = make_zones(cfg["sectors"], zones_per)
+            cfg_valves = [z["valve"] for z in cfg_zones]
+            cfg_rows, cfg_trees = rows_and_trees(cfg_zones, sp[0], sp[1], u)
+            zone_counts = Counter(z["sector_idx"] for z in cfg_zones)
+            tree_counts = Counter()
+            for lb, _ in cfg_trees:
+                try:
+                    si = int(lb[1:].split("Z", 1)[0]) - 1
+                    tree_counts[si] += 1
+                except ValueError:
+                    pass
+            table_rows = []
+            for i, s in enumerate(cfg["sectors"]):
+                a = area_m2(s)
+                table_rows.append({
+                    "Sector": f"S{i+1}",
+                    "Area (m\u00b2)": round(a),
+                    "Area (ha)": round(a / 10000, 3),
+                    "Share (%)": round(100 * a / land_area, 2) if land_area else 0,
+                    "Zones": zone_counts[i],
+                    "Trees": tree_counts[i],
+                })
+            sec_area_sum = sum(area_m2(s) for s in cfg["sectors"])
+            table_rows.append({
+                "Sector": "Total",
+                "Area (m\u00b2)": round(sec_area_sum),
+                "Area (ha)": round(sec_area_sum / 10000, 3),
+                "Share (%)": round(100 * sec_area_sum / land_area, 2) if land_area else 0,
+                "Zones": len(cfg_zones),
+                "Trees": len(cfg_trees),
+            })
+            cfg_df = pd.DataFrame(table_rows)
             st.dataframe(cfg_df, width="stretch")
+
+            # per-zone breakdown: Sector | Zone | Row | Trees (+ subtotals)
+            row_tree_counts = Counter()
+            for tl, _ in cfg_trees:
+                row_tree_counts[tl[: tl.rindex("T")]] += 1
+            breakdown = []
+            for i, s in enumerate(cfg["sectors"]):
+                sname = f"S{i+1}"
+                zone_objs = [z for z in cfg_zones if z["sector_idx"] == i]
+                sector_trees = 0
+                for z in zone_objs:
+                    zname = z["label"]
+                    zone_rows = [(rl, g) for rl, g in cfg_rows
+                                 if rl.startswith(f"{zname}R")]
+                    zone_trees = 0
+                    for rl, _ in zone_rows:
+                        tc = row_tree_counts.get(rl, 0)
+                        zone_trees += tc
+                        breakdown.append({"Sector": sname, "Zone": zname,
+                                          "Row": rl, "Trees": tc})
+                    breakdown.append({"Sector": sname, "Zone": zname,
+                                      "Row": "Subtotal", "Trees": zone_trees})
+                    sector_trees += zone_trees
+                breakdown.append({"Sector": sname, "Zone": "Subtotal",
+                                  "Row": "", "Trees": sector_trees})
+            breakdown.append({"Sector": "Total", "Zone": "", "Row": "",
+                              "Trees": len(cfg_trees)})
+            st.markdown("**Rows & trees per zone**")
+            st.dataframe(pd.DataFrame(breakdown), hide_index=True, width="stretch")
+
             cfg_map = build_planner_map(
-                land, cfg["sectors"], [], [], basin_pt, basin_alt,
-                [], sec_tile, {}, show_sectors_only=True)
-            st_folium(cfg_map, width="100%", height=480)
+                land, cfg["sectors"], cfg_zones, cfg_valves, basin_pt, basin_alt,
+                [], sec_tile, {}, show_sectors_only=False,
+                rows=cfg_rows, trees=cfg_trees, layers=map_layers)
+            st_folium(cfg_map, width="100%", height=480, key=f"sector_map_{idx}")
+            st.caption(f"{len(cfg_rows)} planting rows, {len(cfg_trees)} trees "
+                       f"in this config (row spacing {sp[0]:g} m, "
+                       f"tree spacing {sp[1]:g} m).")
+            cfg_csv = plan_to_csv(land, cfg["sectors"], cfg_zones, None, valve_alts,
+                                  rows=cfg_rows, trees=cfg_trees)
+            csv_path = _save_config_csv(cfg_csv, cfg["key"])
+            st.caption(f"Saved `{Path(csv_path).name}` to `output/`")
     st.divider()
-
-    # ---- costs & comparison ----
-    dfc = pd.DataFrame(table)
-    dfc = dfc.set_index("Option")
-    st.subheader("Budget comparison (3 trench configurations)")
-    st.dataframe(dfc.style.format({
-        "Pipe (m)": "{:,.0f}", "Pump (kW)": "{:.2f}",
-        "Pipe cost": eur, "Valve cost": eur, "Pump cost": eur,
-        "Basin cost": eur, "Total": eur}, na_rep="-"), width="stretch")
-
-    st.bar_chart(dfc["Total"])
-
-    best = min(table, key=lambda r: r["Total"])
-    st.success(
-        f"**Lowest budget: Option {best['Option']}** ({best['Description']}) at "
-        f"**{eur(best['Total'])}**. Total pipe {best['Pipe (m)']:,} m, "
-        f"{best['Valves']} valves."
-        + (" Gravity feed - no pump. " if head_m is not None and head_m <= 0 else " ")
-        + "Trenches follow the contour computed from your point-level data."
-    )
 
     exp_x, exp_y = st.columns([1, 2.4])
     with exp_x:
         exp_opt = st.selectbox(
             "Trench layout in export",
-            ["Best (lowest budget)", "Option A", "Option B", "Option C", "None"],
+            ["Option A", "Option B", "Option C", "None"],
             index=0,
             key="export_trench_opt",
         )
     key_map = {"Option A": "A", "Option B": "B", "Option C": "C"}
-    if exp_opt.startswith("Best"):
-        chosen_key = best["Option"]
-    elif exp_opt == "None":
+    if exp_opt == "None":
         chosen_key = None
     else:
         chosen_key = key_map[exp_opt]
     chosen_cfg = next((c for c in configs if c["key"] == chosen_key), None) if chosen_key else None
-    plan_csv = plan_to_csv(land, sectors, zones, chosen_cfg, valve_alts)
-    plan_path = _auto_save_plan(plan_csv)
+    plan_rows, plan_trees = rows_and_trees(zones, sp[0], sp[1], u)
+    plan_csv = plan_to_csv(land, sectors, zones, chosen_cfg, valve_alts,
+                           rows=plan_rows, trees=plan_trees)
+    plan_path = _save_config_csv(plan_csv, "final_plan")
     with exp_y:
         st.download_button(
             "Export final plan to CSV (input format)",
@@ -1131,7 +1520,8 @@ def render_planner_tab(df: pd.DataFrame, fetch_alt: bool):
             file_name="irrigation_plan.csv",
             mime="text/csv",
         )
-        st.caption(f"{n_sectors} sectors, {len(zones)} zones and valves"
+        st.caption(f"{n_sectors} sectors, {len(zones)} zones and valves, "
+                   f"{len(plan_rows)} planting rows and {len(plan_trees)} trees"
                    + (" plus the trench polyline layout" if exp_opt != "None" else "")
                    + " - same WKT, name, description columns as the input CSV.")
         if plan_path:

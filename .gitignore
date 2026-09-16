@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 elevations_cache.json
 output/
+.agents/
+.claude/
+input/
