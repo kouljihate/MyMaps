@@ -733,7 +733,7 @@ def build_configs(land, sectors, zones, basin_pt, u, vh):
 # planner map
 # ---------------------------------------------------------------------------
 def build_planner_map(land, sectors, zones, valves, basin_pt, basin_alt,
-                      configs, tile_name, valve_alts):
+                      configs, tile_name, valve_alts, show_sectors_only=False):
     center = [(land.bounds[1] + land.bounds[3]) / 2, (land.bounds[0] + land.bounds[2]) / 2]
     m = folium.Map(location=center, zoom_start=18, tiles=None, control_scale=True)
     for name, cfg in TILE_LAYERS.items():
@@ -762,8 +762,12 @@ def build_planner_map(land, sectors, zones, valves, basin_pt, basin_alt,
             "color": "#f07d00", "weight": 2, "fillColor": "#f07d00",
             "fillOpacity": 0.10, "dashArray": "5,5"},
         tooltip=folium.GeoJsonTooltip(fields=["sector", "area_m2"],
-                                      aliases=["Sector", "Area m2"], sticky=True),
+                                       aliases=["Sector", "Area m2"], sticky=True),
     ).add_to(m)
+
+    if show_sectors_only:
+        folium.LayerControl(collapsed=True).add_to(m)
+        return m
 
     # zones
     fc_z = {"type": "FeatureCollection", "features": [
@@ -1048,6 +1052,19 @@ def render_planner_tab(df: pd.DataFrame, fetch_alt: bool):
         note.append("Trenches are drawn along contour lines estimated from the "
                     "loaded point altitudes.")
     st.caption(" ".join(note))
+
+    st.subheader("Sector overview")
+    sec_tile = st.selectbox("Sector base map", list(TILE_LAYERS), key="sector_tile")
+    sec_df = pd.DataFrame([{
+        "Sector": f"S{i+1}",
+        "Area (m\u00b2)": round(area_m2(s)),
+        "Area (ha)": round(area_m2(s) / 10000, 3),
+    } for i, s in enumerate(sectors)])
+    st.dataframe(sec_df, width="stretch")
+    sec_map = build_planner_map(land, sectors, [], [], basin_pt, basin_alt,
+                                [], sec_tile, {}, show_sectors_only=True)
+    st_folium(sec_map, width="100%", height=500)
+    st.divider()
 
     p_tile = st.selectbox("Planner base map", list(TILE_LAYERS), key="planner_tile")
     pmap, pinfo = st.columns([2.2, 1.4])
